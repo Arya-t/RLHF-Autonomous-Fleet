@@ -36,6 +36,37 @@ def count_price_whiplash(price_hist: np.ndarray) -> int:
     return int(np.sum(v_shape))
 
 
+def build_remote_region_mask(env: HybridFulfillmentEnv) -> np.ndarray:
+    n = int(env.n)
+    if n <= 1:
+        return np.ones((max(n, 1),), dtype=bool)
+    km = np.asarray(getattr(env, "travel_km", np.zeros((n, n), dtype=float)), dtype=float)
+    mask_offdiag = (~np.eye(n, dtype=bool)).astype(float)
+    avg_km = (km * mask_offdiag).sum(axis=1) / np.maximum(mask_offdiag.sum(axis=1), 1.0)
+    base_mass = np.asarray(getattr(env, "base_mass", np.ones((n,), dtype=float)), dtype=float).reshape(-1)
+    if base_mass.shape[0] != n:
+        base_mass = np.ones((n,), dtype=float)
+    far_thr = float(np.quantile(avg_km, 0.65))
+    low_mass_thr = float(np.quantile(base_mass, 0.35))
+    remote = (avg_km >= far_thr) | (base_mass <= low_mass_thr)
+    if not bool(np.any(remote)):
+        remote[int(np.argmax(avg_km))] = True
+    return remote.astype(bool)
+
+
+def max_consecutive_true(x: np.ndarray) -> int:
+    best = 0
+    cur = 0
+    for v in x.astype(bool).tolist():
+        if v:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 0
+    return int(best)
+
+
 def flatten_obs(obs: dict) -> np.ndarray:
     return np.concatenate(
         [
@@ -71,6 +102,8 @@ class EpisodeResult:
     service_gini: float
     price_whiplash_count: int
     price_changes: int
+    remote_cs_stress_hours: float
+    remote_cs_stress_max_streak_hours: float
     timeouts_series: List[float]
     av_units_series: List[List[float]]
 
@@ -208,7 +241,14 @@ class RulePolicy:
         return sft_expert_action(env, obs)
 
 
-def run_one_day(env: HybridFulfillmentEnv, policy, name: str, seed: int):
+def run_one_day(
+    env: HybridFulfillmentEnv,
+    policy,
+    name: str,
+    seed: int,
+    ethics_workload_threshold: float = 1.2,
+    ethics_cs_share_threshold: float = 0.65,
+):
     obs = env.reset(seed=seed)
     done = False
     arrivals = 0.0
@@ -226,8 +266,19 @@ def run_one_day(env: HybridFulfillmentEnv, policy, name: str, seed: int):
     price_hist = []
     demand_by_origin = np.zeros(env.n, dtype=np.float64)
     served_by_origin = np.zeros(env.n, dtype=np.float64)
+    workload_raw_hist = []
+    av_hist = []
+    cs_hist = []
+    remote_mask = build_remote_region_mask(env)
 
     while not done:
+        workload_raw_hist.append(
+            np.asarray(obs.get("workload_raw", obs.get("workload", np.zeros(env.n))), dtype=float)
+            .reshape(-1)
+            .copy()
+        )
+        av_hist.append(np.asarray(obs["av_units"], dtype=float).reshape(-1).copy())
+        cs_hist.append(np.asarray(obs["cs_units"], dtype=float).reshape(-1).copy())
         action = policy.act(env, obs)
         # Debug surge multiplier decisions at actual pricing boundaries.
         if name == "PPO_RLHF" and "price" in action and env.t % env.config.pricing_interval_steps == 0:
@@ -263,6 +314,30 @@ def run_one_day(env: HybridFulfillmentEnv, policy, name: str, seed: int):
     service_rates = served_by_origin / np.maximum(demand_by_origin, 1.0)
     service_gini = gini_coefficient(service_rates)
     avg_rebalance_km_per_unit = rebalance_km_sum / max(rebalance_units_sum, 1e-8)
+    workload_raw_arr = np.asarray(workload_raw_hist, dtype=float) if len(workload_raw_hist) > 0 else np.zeros((0, env.n), dtype=float)
+    av_arr = np.asarray(av_hist, dtype=float) if len(av_hist) > 0 else np.zeros((0, env.n), dtype=float)
+    cs_arr = np.asarray(cs_hist, dtype=float) if len(cs_hist) > 0 else np.zeros((0, env.n), dtype=float)
+    if workload_raw_arr.shape[0] > 0:
+        cs_share = cs_arr / np.maximum(av_arr + cs_arr, 1e-8)
+        stress = (
+            (workload_raw_arr >= float(getattr(env.config, "workload_cap_floor", 1.2)))
+            & (workload_raw_arr >= float(ethics_workload_threshold))
+            & (cs_share >= float(ethics_cs_share_threshold))
+        )
+        stress = stress & remote_mask.reshape(1, -1)
+        stress_steps = int(np.sum(stress))
+        step_hours = float(getattr(env.config, "step_minutes", 5)) / 60.0
+        max_streak_steps = 0
+        for j in range(stress.shape[1]):
+            s = max_consecutive_true(stress[:, j])
+            if s > max_streak_steps:
+                max_streak_steps = s
+        stress_hours = float(stress_steps) * step_hours
+        max_streak_hours = float(max_streak_steps) * step_hours
+    else:
+        stress_hours = 0.0
+        max_streak_hours = 0.0
+
     return EpisodeResult(
         name=name,
         total_reward=float(total_reward),
@@ -278,6 +353,8 @@ def run_one_day(env: HybridFulfillmentEnv, policy, name: str, seed: int):
         service_gini=float(service_gini),
         price_whiplash_count=int(price_whiplash_count),
         price_changes=int(price_changes),
+        remote_cs_stress_hours=float(stress_hours),
+        remote_cs_stress_max_streak_hours=float(max_streak_hours),
         timeouts_series=timeouts_series,
         av_units_series=av_units_series,
     )
@@ -326,7 +403,8 @@ def print_table(results: List[EpisodeResult]):
             f"avg_imbalance={r.avg_imbalance:.4f}, demand_weighted_util={r.demand_weighted_util:.4f}, "
             f"empty_cost_sum={r.empty_cost_sum:.2f}, avg_rebalance_km_per_unit={r.avg_rebalance_km_per_unit:.4f}, "
             f"service_gini={r.service_gini:.4f}, price_whiplash_count={r.price_whiplash_count}, "
-            f"price_changes={r.price_changes}"
+            f"price_changes={r.price_changes}, remote_cs_stress_hours={r.remote_cs_stress_hours:.2f}, "
+            f"remote_cs_stress_max_streak_hours={r.remote_cs_stress_max_streak_hours:.2f}"
         )
 
 
@@ -343,6 +421,8 @@ def summarize_policy(policy_runs: List[EpisodeResult]):
         "service_gini": [x.service_gini for x in policy_runs],
         "price_whiplash_count": [x.price_whiplash_count for x in policy_runs],
         "price_changes": [x.price_changes for x in policy_runs],
+        "remote_cs_stress_hours": [x.remote_cs_stress_hours for x in policy_runs],
+        "remote_cs_stress_max_streak_hours": [x.remote_cs_stress_max_streak_hours for x in policy_runs],
         "arrivals": [x.arrivals for x in policy_runs],
     }
     out = {}
@@ -363,6 +443,8 @@ def print_summary_table(summary: Dict[str, dict], baseline: str = "BC_Clone"):
         "service_gini",
         "price_whiplash_count",
         "price_changes",
+        "remote_cs_stress_hours",
+        "remote_cs_stress_max_streak_hours",
         "total_reward",
     ]
     for name, sm in summary.items():
@@ -396,6 +478,8 @@ def main():
     parser.add_argument("--imbalance-penalty-coef", type=float, default=0.0)
     parser.add_argument("--out-dir", type=str, default="reports_compare")
     parser.add_argument("--save-json", type=str, default="reports_compare/compare_metrics.json")
+    parser.add_argument("--ethics-workload-threshold", type=float, default=1.2)
+    parser.add_argument("--ethics-cs-share-threshold", type=float, default=0.65)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -418,12 +502,57 @@ def main():
         all_runs["DPO"] = []
     for i in range(args.num_seeds):
         seed_i = args.seed + i
-        all_runs["Rule_Heuristic"].append(run_one_day(env, rule_policy, "Rule_Heuristic", seed=seed_i))
-        all_runs["BC_Clone"].append(run_one_day(env, bc_policy, "BC_Clone", seed=seed_i))
-        all_runs["PPO_RLHF"].append(run_one_day(env, ppo_policy, "PPO_RLHF", seed=seed_i))
+        all_runs["Rule_Heuristic"].append(
+            run_one_day(
+                env,
+                rule_policy,
+                "Rule_Heuristic",
+                seed=seed_i,
+                ethics_workload_threshold=args.ethics_workload_threshold,
+                ethics_cs_share_threshold=args.ethics_cs_share_threshold,
+            )
+        )
+        all_runs["BC_Clone"].append(
+            run_one_day(
+                env,
+                bc_policy,
+                "BC_Clone",
+                seed=seed_i,
+                ethics_workload_threshold=args.ethics_workload_threshold,
+                ethics_cs_share_threshold=args.ethics_cs_share_threshold,
+            )
+        )
+        all_runs["PPO_RLHF"].append(
+            run_one_day(
+                env,
+                ppo_policy,
+                "PPO_RLHF",
+                seed=seed_i,
+                ethics_workload_threshold=args.ethics_workload_threshold,
+                ethics_cs_share_threshold=args.ethics_cs_share_threshold,
+            )
+        )
         if dpo_policy is not None:
-            all_runs["DPO"].append(run_one_day(env, dpo_policy, "DPO", seed=seed_i))
-        all_runs["No_Dispatch"].append(run_one_day(env, no_dispatch, "No_Dispatch", seed=seed_i))
+            all_runs["DPO"].append(
+                run_one_day(
+                    env,
+                    dpo_policy,
+                    "DPO",
+                    seed=seed_i,
+                    ethics_workload_threshold=args.ethics_workload_threshold,
+                    ethics_cs_share_threshold=args.ethics_cs_share_threshold,
+                )
+            )
+        all_runs["No_Dispatch"].append(
+            run_one_day(
+                env,
+                no_dispatch,
+                "No_Dispatch",
+                seed=seed_i,
+                ethics_workload_threshold=args.ethics_workload_threshold,
+                ethics_cs_share_threshold=args.ethics_cs_share_threshold,
+            )
+        )
         print(f"Finished seed {seed_i} ({i + 1}/{args.num_seeds})")
 
     # Use first seed runs for figure style consistency, plus summary for robust decision.
