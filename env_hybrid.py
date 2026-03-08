@@ -339,6 +339,7 @@ class HybridFulfillmentEnv:
         av_cap_total = 0.0
         av_cap_by_origin = np.zeros(self.n, dtype=float)
         served_av_by_origin = np.zeros(self.n, dtype=float)
+        served_cs_by_origin = np.zeros(self.n, dtype=float)
         served_total_by_origin = np.zeros(self.n, dtype=float)
 
         for i in range(self.n):
@@ -382,6 +383,7 @@ class HybridFulfillmentEnv:
                     served_av_by_origin[i] += x_av
                     served_total_by_origin[i] += x
                     served_cs_total += x_cs
+                    served_cs_by_origin[i] += x_cs
 
                     # move capacity units to destination after travel delay
                     if x_av > 0:
@@ -436,10 +438,13 @@ class HybridFulfillmentEnv:
             platform_revenue,
             service_cost,
             demand_weighted_util,
+            served_av_by_origin,
+            served_cs_by_origin,
             served_total_by_origin,
         )
 
     def _timeout_and_age(self):
+        timeout_by_origin = np.sum(self.backlog[:, :, self.ttl_steps - 1], axis=1).astype(float)
         timeout_now = float(np.sum(self.backlog[:, :, self.ttl_steps - 1]))
         # remove timed-out then age queue
         self.backlog[:, :, self.ttl_steps - 1] = 0.0
@@ -447,7 +452,7 @@ class HybridFulfillmentEnv:
             self.backlog[:, :, 1:] = self.backlog[:, :, :-1]
             self.backlog[:, :, 0] = 0.0
         self.metrics["timeout_sum"] += timeout_now
-        return timeout_now
+        return timeout_now, timeout_by_origin
 
     def _workload_raw(self):
         outstanding = np.sum(self.backlog, axis=(1, 2))
@@ -512,8 +517,18 @@ class HybridFulfillmentEnv:
 
         self._update_cs_supply_by_price()
         arrivals = self._sample_arrivals()
-        served, served_av, served_cs, revenue, service_cost, demand_weighted_util, served_by_origin = self._serve_orders()
-        timeout_now = self._timeout_and_age()
+        (
+            served,
+            served_av,
+            served_cs,
+            revenue,
+            service_cost,
+            demand_weighted_util,
+            served_av_by_origin,
+            served_cs_by_origin,
+            served_by_origin,
+        ) = self._serve_orders()
+        timeout_now, timeout_by_origin = self._timeout_and_age()
 
         workload = self._workload()
         # Use log scale for robustness so rare pressure spikes don't dominate reward.
@@ -554,6 +569,9 @@ class HybridFulfillmentEnv:
             "rebalance_units": float(rebalance_units),
             "av_fixed_cost": float(av_fixed_cost),
             "arrivals_by_origin": self.last_arrivals_by_origin.astype(float),
+            "timeout_by_origin": np.asarray(timeout_by_origin, dtype=float),
+            "served_av_by_origin": np.asarray(served_av_by_origin, dtype=float),
+            "served_cs_by_origin": np.asarray(served_cs_by_origin, dtype=float),
             "served_by_origin": np.asarray(served_by_origin, dtype=float),
             "workload_raw": self._workload_raw().astype(float),
             "reward": float(reward),

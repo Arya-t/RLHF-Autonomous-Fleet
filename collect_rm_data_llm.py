@@ -55,6 +55,13 @@ class CollectConfig:
     ethics_hours_threshold: float = 6.0
     gray_reward_margin_ratio: float = 0.03
     gray_timeout_margin_pp: float = 0.5
+    focus_remote_prob: float = 0.35
+    focus_peak_prob: float = 0.25
+    focus_near_tie_prob: float = 0.25
+    focus_remote_w_raw_threshold: float = 1.2
+    focus_max_warmup_trials: int = 6
+    near_tie_noise_delta: float = 0.03
+    peak_slot_quantile: float = 0.70
 
 
 def flatten_obs(obs: dict) -> np.ndarray:
@@ -134,6 +141,33 @@ def has_ethics_risk(summary: dict, cfg: CollectConfig) -> bool:
         float(summary.get("remote_cs_stress_hours", 0.0)) >= float(cfg.ethics_hours_threshold)
         or int(summary.get("remote_cs_stress_max_streak_steps", 0)) >= int(cfg.ethics_max_streak_steps)
     )
+
+
+def build_peak_slot_mask(env: HybridFulfillmentEnv, quantile: float = 0.70) -> np.ndarray:
+    q = float(np.clip(quantile, 0.0, 1.0))
+    vals = np.array([float(env._period_factor(s)) for s in range(env.period_num)], dtype=float)
+    thr = float(np.quantile(vals, q))
+    return (vals >= thr).astype(bool)
+
+
+def select_focus_mode(cfg: CollectConfig) -> str:
+    p_remote = max(0.0, float(cfg.focus_remote_prob))
+    p_peak = max(0.0, float(cfg.focus_peak_prob))
+    p_near = max(0.0, float(cfg.focus_near_tie_prob))
+    s = p_remote + p_peak + p_near
+    if s > 0.999:
+        scale = 0.999 / s
+        p_remote *= scale
+        p_peak *= scale
+        p_near *= scale
+    u = float(np.random.rand())
+    if u < p_remote:
+        return "remote"
+    if u < p_remote + p_peak:
+        return "peak"
+    if u < p_remote + p_peak + p_near:
+        return "near_tie"
+    return "default"
 
 
 class BCPolicy:
@@ -379,15 +413,13 @@ def rollout_trajectory(env: HybridFulfillmentEnv, policy: BCPolicy, cfg: Collect
     demand_by_origin = np.zeros(env.n, dtype=np.float64)
     remote_mask = build_remote_region_mask(env)
     workload_raw_hist = []
-    av_hist = []
-    cs_hist = []
+    served_av_hist = []
+    served_cs_hist = []
     obs = env._get_obs()
 
     actual_steps = 0
     for _ in range(steps):
         workload_raw_hist.append(np.asarray(obs.get("workload_raw", obs.get("workload", np.zeros(env.n))), dtype=float))
-        av_hist.append(np.asarray(obs.get("av_units", np.zeros(env.n)), dtype=float))
-        cs_hist.append(np.asarray(obs.get("cs_units", np.zeros(env.n)), dtype=float))
         state_vec = flatten_obs(obs)
         traj["states"].append(state_vec.tolist())
 
@@ -427,23 +459,32 @@ def rollout_trajectory(env: HybridFulfillmentEnv, policy: BCPolicy, cfg: Collect
         metrics["total_reward"] += float(rew)
         arr_by_origin = np.asarray(info.get("arrivals_by_origin", np.zeros(env.n, dtype=float)), dtype=float)
         srv_by_origin = np.asarray(info.get("served_by_origin", np.zeros(env.n, dtype=float)), dtype=float)
+        srv_av_by_origin = np.asarray(info.get("served_av_by_origin", np.zeros(env.n, dtype=float)), dtype=float)
+        srv_cs_by_origin = np.asarray(info.get("served_cs_by_origin", np.zeros(env.n, dtype=float)), dtype=float)
         if arr_by_origin.shape == (env.n,):
             demand_by_origin += np.maximum(arr_by_origin, 0.0)
         if srv_by_origin.shape == (env.n,):
             served_by_origin += np.maximum(srv_by_origin, 0.0)
+        if srv_av_by_origin.shape == (env.n,):
+            served_av_hist.append(np.maximum(srv_av_by_origin, 0.0))
+        else:
+            served_av_hist.append(np.zeros(env.n, dtype=float))
+        if srv_cs_by_origin.shape == (env.n,):
+            served_cs_hist.append(np.maximum(srv_cs_by_origin, 0.0))
+        else:
+            served_cs_hist.append(np.zeros(env.n, dtype=float))
         actual_steps += 1
         if done:
             break
 
     price_hist = np.asarray(price_history, dtype=int) if len(price_history) > 0 else np.zeros((0, env.n), dtype=int)
     workload_raw_arr = np.asarray(workload_raw_hist, dtype=float) if len(workload_raw_hist) > 0 else np.zeros((0, env.n), dtype=float)
-    av_arr = np.asarray(av_hist, dtype=float) if len(av_hist) > 0 else np.zeros((0, env.n), dtype=float)
-    cs_arr = np.asarray(cs_hist, dtype=float) if len(cs_hist) > 0 else np.zeros((0, env.n), dtype=float)
+    served_av_arr = np.asarray(served_av_hist, dtype=float) if len(served_av_hist) > 0 else np.zeros((0, env.n), dtype=float)
+    served_cs_arr = np.asarray(served_cs_hist, dtype=float) if len(served_cs_hist) > 0 else np.zeros((0, env.n), dtype=float)
     if workload_raw_arr.shape[0] > 0:
-        cs_share = cs_arr / np.maximum(av_arr + cs_arr, 1e-8)
+        cs_share = served_cs_arr / np.maximum(served_av_arr + served_cs_arr, 1e-8)
         stress = (
-            (workload_raw_arr >= float(env.config.workload_cap_floor))
-            & (workload_raw_arr >= float(cfg.ethics_workload_threshold))
+            (workload_raw_arr >= float(cfg.ethics_workload_threshold))
             & (cs_share >= float(cfg.ethics_cs_share_threshold))
         )
         stress = stress & remote_mask.reshape(1, -1)
@@ -564,6 +605,9 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
     timeout_gap_total = 0
     swap_count = 0
     hard_neg_accepted = 0
+    focus_counter = {"remote": 0, "peak": 0, "near_tie": 0, "default": 0}
+    peak_slot_mask = build_peak_slot_mask(env_base, quantile=cfg.peak_slot_quantile)
+    remote_mask = build_remote_region_mask(env_base)
 
     client = None
     if cfg.mode == "qwen":
@@ -581,12 +625,32 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
                 print(f"Stop at max_attempts={cfg.max_attempts}. accepted={len(dataset)}")
                 break
 
-            env_base.reset(seed=cfg.seed + len(dataset))
-            warm_steps = np.random.randint(0, min(cfg.warmup_max_steps, env_base.config.max_steps))
-            for _ in range(warm_steps):
-                _, _, done, _ = env_base.step({})
-                if done:
+            focus_mode = select_focus_mode(cfg)
+            focus_counter[focus_mode] = focus_counter.get(focus_mode, 0) + 1
+            last_env_state_ok = False
+            max_trials = max(1, int(cfg.focus_max_warmup_trials))
+            for trial in range(max_trials):
+                env_base.reset(seed=cfg.seed + attempts * 97 + trial * 13)
+                warm_steps = np.random.randint(0, min(cfg.warmup_max_steps, env_base.config.max_steps))
+                for _ in range(warm_steps):
+                    _, _, done, _ = env_base.step({})
+                    if done:
+                        break
+                obs0 = env_base._get_obs()
+                if focus_mode == "remote":
+                    w_raw = np.asarray(obs0.get("workload_raw", obs0.get("workload", np.zeros(env_base.n))), dtype=float).reshape(-1)
+                    ok = bool(np.any((w_raw >= float(cfg.focus_remote_w_raw_threshold)) & remote_mask))
+                elif focus_mode == "peak":
+                    slot0 = int(obs0.get("slot", 0))
+                    ok = bool(slot0 >= 0 and slot0 < len(peak_slot_mask) and peak_slot_mask[slot0])
+                else:
+                    ok = True
+                if ok:
+                    last_env_state_ok = True
                     break
+            if not last_env_state_ok:
+                # keep the last state even if not matched; avoids dead loops
+                pass
 
             env_a = safe_clone_env(env_base)
             env_b = safe_clone_env(env_base)
@@ -595,7 +659,11 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
 
             # Adversarial sampling mode: enlarge one branch's exploration to trigger
             # "high-reward-but-soft-metrics-worse" cases.
-            if bool(np.random.rand() < cfg.hard_neg_sampling_prob):
+            if focus_mode == "near_tie":
+                base_noise = min(float(cfg.noise_a), float(cfg.noise_b))
+                delta = abs(float(cfg.near_tie_noise_delta))
+                noise_for_a, noise_for_b = base_noise, max(0.0, base_noise + delta)
+            elif bool(np.random.rand() < cfg.hard_neg_sampling_prob) or focus_mode in {"remote", "peak"}:
                 if bool(np.random.rand() < 0.5):
                     noise_for_a, noise_for_b = cfg.noise_a, cfg.hard_neg_noise
                 else:
@@ -615,12 +683,27 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
             timeout_diff_pp = abs(float(summary_a.get("timeout_rate", 0.0)) - float(summary_b.get("timeout_rate", 0.0)))
             km_diff = abs(float(summary_a.get("avg_rebalance_km_per_unit", 0.0)) - float(summary_b.get("avg_rebalance_km_per_unit", 0.0)))
             hard_negative_flag = is_hard_negative_pair(summary_a, summary_b, cfg)
+            remote_timeout_diff_pp = abs(
+                float(summary_a.get("remote_timeout_rate", 0.0)) - float(summary_b.get("remote_timeout_rate", 0.0))
+            ) * 100.0
+            remote_stress_diff = abs(
+                float(summary_a.get("remote_cs_stress_hours", 0.0)) - float(summary_b.get("remote_cs_stress_hours", 0.0))
+            )
             soft_gate = (
                 whiplash_diff >= 1.0
                 or gini_diff > cfg.gini_margin
                 or timeout_diff_pp > cfg.timeout_filter_pp
                 or km_diff > cfg.km_margin
+                or remote_timeout_diff_pp > cfg.timeout_filter_pp
+                or remote_stress_diff > 0.25
             )
+            if focus_mode == "near_tie":
+                reward_gap = abs(float(summary_a.get("total_reward", 0.0)) - float(summary_b.get("total_reward", 0.0)))
+                reward_close = reward_gap <= _pair_reward_margin(summary_a, summary_b, cfg.gray_reward_margin_ratio)
+                timeout_close = timeout_diff_pp <= float(cfg.gray_timeout_margin_pp)
+                if not (reward_close and timeout_close):
+                    filtered += 1
+                    continue
             if not (soft_gate or hard_negative_flag):
                 filtered += 1
                 if attempts % max(1, cfg.log_every) == 0:
@@ -734,6 +817,7 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
                     "noise_A": float(noise_for_a),
                     "noise_B": float(noise_for_b),
                     "is_hard_negative": bool(hard_negative_flag),
+                    "focus_mode": focus_mode,
                 }
                 dataset.append(item)
                 if hard_negative_flag:
@@ -787,7 +871,10 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
                         f"| timeout_gap>0.5pp_ratio={timeout_gap_ratio:.3f} "
                         f"| chooseA={chosen_a/ab_total:.3f} chooseB={chosen_b/ab_total:.3f} "
                         f"| swap_ratio={swap_count/max(timeout_gap_total,1):.3f} "
-                        f"| hard_neg_ratio={hard_neg_accepted/max(len(dataset),1):.3f}"
+                        f"| hard_neg_ratio={hard_neg_accepted/max(len(dataset),1):.3f} "
+                        f"| focus(remote/peak/near/default)="
+                        f"{focus_counter.get('remote',0)}/{focus_counter.get('peak',0)}/"
+                        f"{focus_counter.get('near_tie',0)}/{focus_counter.get('default',0)}"
                     )
 
         # Rebuild dataset to enforce hard-negative mix for RM robustness.
@@ -803,7 +890,10 @@ def collect_rm_dataset(env_base: HybridFulfillmentEnv, policy: BCPolicy, cfg: Co
         f"pairs={len(dataset)}, attempts={attempts}, filtered={filtered}, api_errors={api_errors}, "
         f"timeout_gap>0.5pp_ratio={timeout_gap_ratio:.3f}, chooseA={chosen_a/ab_total:.3f}, chooseB={chosen_b/ab_total:.3f}, "
         f"swap_ratio={swap_count/max(timeout_gap_total,1):.3f}, "
-        f"hard_neg_before={rebuild_stat.get('hard_neg_before', 0)}, hard_neg_after={rebuild_stat.get('hard_neg_after', 0)}"
+        f"hard_neg_before={rebuild_stat.get('hard_neg_before', 0)}, hard_neg_after={rebuild_stat.get('hard_neg_after', 0)}, "
+        f"focus(remote/peak/near/default)="
+        f"{focus_counter.get('remote',0)}/{focus_counter.get('peak',0)}/"
+        f"{focus_counter.get('near_tie',0)}/{focus_counter.get('default',0)}"
     )
 
 
@@ -901,6 +991,13 @@ def main():
     parser.add_argument("--ethics-hours-threshold", type=float, default=6.0, help="Total remote CS stress hours threshold.")
     parser.add_argument("--gray-reward-margin-ratio", type=float, default=0.03, help="LLM is used when reward gap is within this ratio.")
     parser.add_argument("--gray-timeout-margin-pp", type=float, default=0.5, help="LLM is used when timeout gap is within this margin.")
+    parser.add_argument("--focus-remote-prob", type=float, default=0.35, help="Probability to warm-start from remote high-load states.")
+    parser.add_argument("--focus-peak-prob", type=float, default=0.25, help="Probability to warm-start from peak-demand slots.")
+    parser.add_argument("--focus-near-tie-prob", type=float, default=0.25, help="Probability to sample near-tie pairs for value alignment.")
+    parser.add_argument("--focus-remote-w-raw-threshold", type=float, default=1.2, help="Remote focus threshold on workload_raw.")
+    parser.add_argument("--focus-max-warmup-trials", type=int, default=6, help="Max warmup retries for focus-state targeting.")
+    parser.add_argument("--near-tie-noise-delta", type=float, default=0.03, help="Noise gap for near-tie pair generation.")
+    parser.add_argument("--peak-slot-quantile", type=float, default=0.70, help="Top quantile of period factor treated as peak.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -948,6 +1045,13 @@ def main():
         ethics_hours_threshold=args.ethics_hours_threshold,
         gray_reward_margin_ratio=args.gray_reward_margin_ratio,
         gray_timeout_margin_pp=args.gray_timeout_margin_pp,
+        focus_remote_prob=args.focus_remote_prob,
+        focus_peak_prob=args.focus_peak_prob,
+        focus_near_tie_prob=args.focus_near_tie_prob,
+        focus_remote_w_raw_threshold=args.focus_remote_w_raw_threshold,
+        focus_max_warmup_trials=args.focus_max_warmup_trials,
+        near_tie_noise_delta=args.near_tie_noise_delta,
+        peak_slot_quantile=args.peak_slot_quantile,
     )
     collect_rm_dataset(env_base=env, policy=policy, cfg=collect_cfg)
 
